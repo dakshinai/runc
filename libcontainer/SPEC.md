@@ -200,17 +200,23 @@ tree /sys/fs/resctrl
 |-- ...
 |-- schemata
 |-- tasks
-|-- <container_id>
+|-- <clos_id>
     |-- ...
     |-- schemata
     |-- tasks
 ```
+`clos_id` specifies the identity for RDT Class of Service (CLOS). The default `clos_id` remains `.`
+referring to the top level directory of resctrl filesystem. Every `clos_id` identifies a set of
+tasks and schemata. 'clos_id' enables sharing of RDT control groups for resources like cache and
+memory bandwidth, among containers. In the context of runc, if `clos_id` is not set, we use the
+`container_id` of the container, implying a single container per control group, for which RDT
+resource constraints will be set.
 
-For runc, we can make use of `tasks` and `schemata` configuration for L3
-cache and memory bandwidth resources constraints.
+For runc, we can make use of `tasks`, `schemata` and `clos_id` configuration for L3
+cache and memory bandwidth resource constraints.
 
 The file `tasks` has a list of tasks that belongs to this group (e.g.,
-<container_id>" group). Tasks can be added to a group by writing the task ID
+<container_id>" or <clos_id> group). Tasks can be added to a group by writing the task ID
 to the "tasks" file (which will automatically remove them from the previous
 group to which they belonged). New tasks created by fork(2) and clone(2) are
 added to the same group as their parent.
@@ -225,7 +231,8 @@ contains L3 cache id and capacity bitmask (CBM).
 	Format: "L3:<cache_id0>=<cbm0>;<cache_id1>=<cbm1>;..."
 ```
 For example, on a two-socket machine, the schema line could be "L3:0=ff;1=c0"
-which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM is 0xc0.
+under a `clos_id` `guaranteed_group`, which means L3 cache id 0's CBM is 0xff,
+and L3 cache id 1's CBM is 0xc0 for all tasks assigned under `clos_id` `guaranteed_group`.
 
 The valid L3 cache CBM is a *contiguous bits set* and number of bits that can
 be set is less than the max bit. The max bits in the CBM is varied among
@@ -241,6 +248,9 @@ L3 cache id and memory bandwidth percentage.
 	Format: "MB:<cache_id0>=bandwidth0;<cache_id1>=bandwidth1;..."
 ```
 For example, on a two-socket machine, the schema line could be "MB:0=20;1=70"
+under a `clos_id` `guaranteed_group`, which means all tasks assigned under
+`clos_id` `guaranteed_group` are allocated 20% memory bandwidth on socket 0
+and 70% memory bandwidth on socket 1.
 
 The minimum bandwidth percentage value for each CPU model is predefined and
 can be looked up through "info/MB/min_bandwidth". The bandwidth granularity
@@ -249,8 +259,7 @@ that is allocated is also dependent on the CPU model and can be looked up at
 min_bw + N * bw_gran. Intermediate values are rounded to the next control
 step available on the hardware.
 
-For more information about Intel RDT kernel interface:  
-https://www.kernel.org/doc/Documentation/x86/intel_rdt_ui.txt
+For more information about Intel RDT kernel interface: https://www.kernel.org/doc/Documentation/x86/intel_rdt_ui.txt
 
 ```
 An example for runc:
