@@ -175,6 +175,24 @@ func (v *ConfigValidator) intelrdt(config *configs.Config) error {
 		if config.IntelRdt.L3CacheSchema == "" {
 			return fmt.Errorf("intelRdt is specified in config, but intelRdt.l3CacheSchema is empty")
 		}
+		if config.IntelRdt.L3CacheSchema != "" && config.IntelRdt.ClosID != "" {
+			doesExist, err := intelrdt.DoesClosIDExist(config.IntelRdt.ClosID)
+			if err != nil {
+				return err
+			}
+
+			if doesExist {
+				isMatch, err := intelrdt.CheckClosIDL3CacheSchemaMatch(config.IntelRdt.ClosID, config.IntelRdt.L3CacheSchema)
+				if err != nil {
+					return err
+				} else {
+					if !isMatch {
+						return fmt.Errorf("intelRdt.closID and intelRdt.l3CacheSchema is specified in config, but intelRdt.l3CacheSchema does not match schema reported in existing closID")
+					}
+				}
+			}
+
+		}
 	}
 
 	return nil

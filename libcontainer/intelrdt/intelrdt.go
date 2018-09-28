@@ -49,16 +49,16 @@ import (
  * |-- cpus
  * |-- schemata
  * |-- tasks
- * |-- <container_id>
+ * |-- <clos_id>
  *     |-- cpus
  *     |-- schemata
  *     |-- tasks
  *
- * For runc, we can make use of `tasks` and `schemata` configuration for L3 cache
+ * For runc, we can make use of `tasks`, `schemata` and `clos_id` configuration for L3 cache
  * resource constraints.
  *
  *  The file `tasks` has a list of tasks that belongs to this group (e.g.,
- * <container_id>" group). Tasks can be added to a group by writing the task ID
+ * <container_id>" or <clos_id> group). Tasks can be added to a group by writing the task ID
  * to the "tasks" file  (which will automatically remove them from the previous
  * group to which they belonged). New tasks created by fork(2) and clone(2) are
  * added to the same group as their parent. If a pid is not in any sub group, it is
@@ -67,8 +67,15 @@ import (
  * The file `schemata` has allocation bitmasks/values for L3 cache on each socket,
  * which contains L3 cache id and capacity bitmask (CBM).
  * 	Format: "L3:<cache_id0>=<cbm0>;<cache_id1>=<cbm1>;..."
+ *`clos_id` specifies the identity for RDT Class of Service (CLOS). The default `clos_id` remains `.`
+ * referring to top level directory of resctrl filesystem. Every `clos_id` identifies a set of cpus,
+ * tasks and schemata. In the context of runc, if `clos_id` is not set, we use the `container_id` of the
+ * container, for which RDT resource constraints will be set.
+ *
  * For example, on a two-socket machine, L3's schema line could be `L3:0=ff;1=c0`
- * which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM is 0xc0.
+ * under a `clos_id` `guaranteed_group`
+ * which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM is 0xc0
+ * for all tasks or cpus assigned under `clos_id` `guaranteed_group`.
  *
  * The valid L3 cache CBM is a *contiguous bits set* and number of bits that can
  * be set is less than the max bit. The max bits in the CBM is varied among
@@ -89,6 +96,15 @@ import (
  *
  * "linux": {
  * 	"intelRdt": {
+ *	    "closID" : "<container-id>",
+ *		"l3CacheSchema": "L3:0=ffff0;1=3ff"
+ *	 }
+ *  }
+ * The same configuration can be applied to tasks inside multiple containers when added under
+ * the closID group identified as 'guaranteed_group'
+ * "linux": {
+ * 	"intelRdt": {
+ *	    "closID" : "guaranteed_group",
  * 		"l3CacheSchema": "L3:0=ffff0;1=3ff"
  * 	}
  * }
@@ -106,7 +122,7 @@ type Manager interface {
 
 	// Returns Intel RDT path to save in a state file and to be able to
 	// restore the object later
-	GetPath() string
+	GetPath() (string, error)
 
 	// Set Intel RDT "resource control" filesystem as configured.
 	Set(container *configs.Config) error
@@ -368,6 +384,43 @@ func getL3CacheInfo() (*L3CacheInfo, error) {
 	return l3CacheInfo, nil
 }
 
+// DoesClosIDExist checks if resctrl group represented by "closID" exists
+func DoesClosIDExist(closID string) (bool, error) {
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return false, err
+	}
+
+	path := filepath.Join(rootPath, closID)
+	if _, err := os.Stat(path); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// CheckClosIDL3CacheSchemaMatch checks for a match between closID group L3 cache schemata and given L3 cache schemata
+func CheckClosIDL3CacheSchemaMatch(closID string, l3CacheSchema string) (bool, error) {
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return false, err
+	}
+
+	path := filepath.Join(rootPath, closID)
+	schemata, err := getIntelRdtParamString(path, "schemata")
+	if err != nil {
+		return false, err
+	}
+
+	// L3 cache schema is in the first line
+	schemataStrings := strings.Split(schemata, "\n")
+	if strings.Compare(schemataStrings[0], l3CacheSchema) == 0 {
+		return true, nil
+	} else {
+		return false, nil
+	}
+}
+
 // WriteIntelRdtTasks writes the specified pid into the "tasks" file
 func WriteIntelRdtTasks(dir string, pid int) error {
 	if dir == "" {
@@ -412,12 +465,21 @@ func (m *IntelRdtManager) Apply(pid int) (err error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	path, err := d.join(m.Id)
-	if err != nil {
-		return err
+
+	if m.Config.IntelRdt.ClosID != "" {
+		path, err := d.join(m.Config.IntelRdt.ClosID)
+		if err != nil {
+			return err
+		}
+		m.Path = path
+	} else {
+		path, err := d.join(m.Id)
+		if err != nil {
+			return err
+		}
+		m.Path = path
 	}
 
-	m.Path = path
 	return nil
 }
 
@@ -434,11 +496,17 @@ func (m *IntelRdtManager) Destroy() error {
 
 // Returns Intel RDT path to save in a state file and to be able to
 // restore the object later
-func (m *IntelRdtManager) GetPath() string {
+func (m *IntelRdtManager) GetPath() (string, error) {
+	var err error
+	err = nil
 	if m.Path == "" {
-		m.Path, _ = GetIntelRdtPath(m.Id)
+		if m.Config.IntelRdt.ClosID != "" {
+			m.Path, err = GetIntelRdtPath(m.Config.IntelRdt.ClosID)
+		} else {
+			m.Path, err = GetIntelRdtPath(m.Id)
+		}
 	}
-	return m.Path
+	return m.Path, err
 }
 
 // Returns statistics for Intel RDT
@@ -472,8 +540,12 @@ func (m *IntelRdtManager) GetStats() (*Stats, error) {
 	schemaRootStrings := strings.Split(tmpRootStrings, "\n")
 	stats.L3CacheSchemaRoot = schemaRootStrings[0]
 
+	path, err := m.GetPath()
+	if err != nil {
+		return nil, err
+	}
 	// The L3 cache schema in 'container_id' group
-	tmpStrings, err := getIntelRdtParamString(m.GetPath(), "schemata")
+	tmpStrings, err := getIntelRdtParamString(path, "schemata")
 	if err != nil {
 		return nil, err
 	}
@@ -486,15 +558,23 @@ func (m *IntelRdtManager) GetStats() (*Stats, error) {
 
 // Set Intel RDT "resource control" filesystem as configured.
 func (m *IntelRdtManager) Set(container *configs.Config) error {
-	path := m.GetPath()
+	path, err := m.GetPath()
+	if err != nil {
+		return err
+	}
 
 	// About L3 cache schema file:
 	// The schema has allocation masks/values for L3 cache on each socket,
 	// which contains L3 cache id and capacity bitmask (CBM).
 	//     Format: "L3:<cache_id0>=<cbm0>;<cache_id1>=<cbm1>;..."
+	//`clos_id` specifies the identity for RDT Class of Service (CLOS). The default `clos_id` remains `.`
+	// referring to top level directory of resctrl filesystem. Every `clos_id` identifies a set of cpus,
+	// tasks and schemata. In the context of runc, if `clos_id` is not set, we use the `container_id` of the
+	// container, for which RDT resource constraints will be set.
 	// For example, on a two-socket machine, L3's schema line could be:
 	//     L3:0=ff;1=c0
-	// Which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM is 0xc0.
+	// Which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM is 0xc0
+	// for all tasks or cpus assigned under `clos_id` `guaranteed_group`.
 	//
 	// About L3 cache CBM validity:
 	// The valid L3 cache CBM is a *contiguous bits set* and number of

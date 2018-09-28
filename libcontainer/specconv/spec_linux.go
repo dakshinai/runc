@@ -262,6 +262,9 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		if spec.Linux.IntelRdt.L3CacheSchema != "" {
 			config.IntelRdt.L3CacheSchema = spec.Linux.IntelRdt.L3CacheSchema
 		}
+		if spec.Linux.IntelRdt.ClosID != "" {
+			config.IntelRdt.ClosID = spec.Linux.IntelRdt.ClosID
+		}
 	}
 	return config, nil
 }

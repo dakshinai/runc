@@ -70,8 +70,8 @@ func (m *mockIntelRdtManager) Destroy() error {
 	return nil
 }
 
-func (m *mockIntelRdtManager) GetPath() string {
-	return m.path
+func (m *mockIntelRdtManager) GetPath() (string, error) {
+	return m.path, nil
 }
 
 func (m *mockIntelRdtManager) Set(container *configs.Config) error {
