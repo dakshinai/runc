@@ -186,6 +186,12 @@ func (v *ConfigValidator) intelrdt(config *configs.Config) error {
 		if intelrdt.IsMbaEnabled() && config.IntelRdt.MemBwSchema == "" {
 			return fmt.Errorf("Intel RDT/MBA is enabled and intelRdt is specified in config, but intelRdt.memBwSchema is empty")
 		}
+
+		if config.IntelRdt.ClosID != "" {
+			if err := intelrdt.ValidateClosIDAndSchemaMatch(config.IntelRdt.ClosID, config.IntelRdt.L3CacheSchema, config.IntelRdt.MemBwSchema); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil

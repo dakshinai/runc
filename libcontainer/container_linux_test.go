@@ -62,6 +62,10 @@ func (m *mockIntelRdtManager) Apply(pid int) error {
 	return nil
 }
 
+func (m *mockIntelRdtManager) ApplyPids(pids []int) error {
+	return nil
+}
+
 func (m *mockIntelRdtManager) GetStats() (*intelrdt.Stats, error) {
 	return m.stats, nil
 }
@@ -70,8 +74,8 @@ func (m *mockIntelRdtManager) Destroy() error {
 	return nil
 }
 
-func (m *mockIntelRdtManager) GetPath() string {
-	return m.path
+func (m *mockIntelRdtManager) GetPath(container *configs.Config) (string, error) {
+	return m.path, nil
 }
 
 func (m *mockIntelRdtManager) Set(container *configs.Config) error {
@@ -320,7 +324,8 @@ func TestGetContainerStateAfterUpdate(t *testing.T) {
 			_pid:    pid,
 			started: stat.StartTime,
 		},
-		cgroupManager: &mockCgroupManager{},
+		cgroupManager:   &mockCgroupManager{},
+		intelRdtManager: &mockIntelRdtManager{},
 	}
 	container.state = &createdState{c: container}
 	state, err := container.State()

@@ -62,16 +62,23 @@ import (
  * |-- ...
  * |-- schemata
  * |-- tasks
- * |-- <container_id>
+ * |-- <clos_id>
  *     |-- ...
  *     |-- schemata
  *     |-- tasks
  *
- * For runc, we can make use of `tasks` and `schemata` configuration for L3
- * cache and memory bandwidth resources constraints.
+ *`clos_id` specifies the identity for RDT Class of Service (CLOS). The default `clos_id` remains `.`
+ * referring to top level directory of resctrl filesystem. Every `clos_id` identifies a set of tasks
+ * and schemata. 'clos_id' enables sharing of RDT control groups for resources like cache and
+ * memory bandwidth, among containers. In the context of runc, if `clos_id` is not set, we use the
+ * `container_id` of the container, implying a single container per control group, for which RDT
+ * resource constraints will be set.
+ *
+ * For runc, we can make use of `tasks`, `schemata` and `clos_id` configuration for
+ * L3 cache and memory bandwidth resources constraints.
  *
  * The file `tasks` has a list of tasks that belongs to this group (e.g.,
- * <container_id>" group). Tasks can be added to a group by writing the task ID
+ * <container_id>" or <clos_id> group). Tasks can be added to a group by writing the task ID
  * to the "tasks" file (which will automatically remove them from the previous
  * group to which they belonged). New tasks created by fork(2) and clone(2) are
  * added to the same group as their parent.
@@ -84,7 +91,8 @@ import (
  * contains L3 cache id and capacity bitmask (CBM).
  * 	Format: "L3:<cache_id0>=<cbm0>;<cache_id1>=<cbm1>;..."
  * For example, on a two-socket machine, the schema line could be "L3:0=ff;1=c0"
- * which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM is 0xc0.
+ * under a `clos_id` `guaranteed_group`, which means L3 cache id 0's CBM is 0xff,
+ * and L3 cache id 1's CBM is 0xc0 for all tasks assigned under `clos_id` `guaranteed_group`.
  *
  * The valid L3 cache CBM is a *contiguous bits set* and number of bits that can
  * be set is less than the max bit. The max bits in the CBM is varied among
@@ -98,6 +106,9 @@ import (
  * L3 cache id and memory bandwidth percentage.
  * 	Format: "MB:<cache_id0>=bandwidth0;<cache_id1>=bandwidth1;..."
  * For example, on a two-socket machine, the schema line could be "MB:0=20;1=70"
+ * under a `clos_id` `guaranteed_group`, which means all tasks assigned under
+ * `clos_id` `guaranteed_group` are allocated 20% memory bandwidth on socket 0
+ * and 70% memory bandwidth on socket 1.
  *
  * The minimum bandwidth percentage value for each CPU model is predefined and
  * can be looked up through "info/MB/min_bandwidth". The bandwidth granularity
@@ -120,6 +131,7 @@ import (
  *
  * "linux": {
  *     "intelRdt": {
+ *         "closID" : "guaranteed_group",
  *         "l3CacheSchema": "L3:0=7f0;1=1f",
  *         "memBwSchema": "MB:0=20;1=70"
  * 	}
@@ -130,6 +142,9 @@ type Manager interface {
 	// Applies Intel RDT configuration to the process with the specified pid
 	Apply(pid int) error
 
+	// Applies Intel RDT configuration to the process with the specified pids
+	ApplyPids(pids []int) error
+
 	// Returns statistics for Intel RDT
 	GetStats() (*Stats, error)
 
@@ -138,7 +153,7 @@ type Manager interface {
 
 	// Returns Intel RDT path to save in a state file and to be able to
 	// restore the object later
-	GetPath() string
+	GetPath(container *configs.Config) (string, error)
 
 	// Set Intel RDT "resource control" filesystem as configured.
 	Set(container *configs.Config) error
@@ -404,6 +419,152 @@ func getL3CacheInfo() (*L3CacheInfo, error) {
 	return l3CacheInfo, nil
 }
 
+// DoesClosIDExist checks if resctrl group represented by "closID" exists
+func DoesClosIDExist(closID string) (bool, error) {
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return false, err
+	}
+
+	path := filepath.Join(rootPath, closID)
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		} else {
+			return false, err
+		}
+	}
+
+	return true, nil
+}
+
+// CheckClosIDSchemaMatch checks for match on schemata represented by existing ClosID RDT control group for L3 cache and
+// memory bandwidth constraints and given schemata
+func CheckClosIDSchemaMatch(closID string, l3CacheSchema string, memBwSchema string) (bool, bool, error) {
+	if closID == "" {
+		return false, false, fmt.Errorf("closID parameter is empty in the function call to CheckClosIDSchemaMatch")
+	}
+
+	if l3CacheSchema == "" && memBwSchema == "" {
+		return false, false, fmt.Errorf("both parameters l3CacheSchema and memBwSchema are empty in the function call to CheckClosIDSchemaMatch")
+	}
+
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return false, false, err
+	}
+
+	path := filepath.Join(rootPath, closID)
+	if _, err := os.Stat(path); err != nil {
+		return false, false, err
+	}
+
+	schemata, err := getIntelRdtParamString(path, "schemata")
+	if err != nil {
+		return false, false, err
+	}
+
+	l3CacheSchemaMatch := false
+	memBwSchemaMatch := false
+
+	// L3 cache schema is always in the first line
+	schemataStrings := strings.Split(schemata, "\n")
+	if IsCatEnabled() && l3CacheSchema != "" && len(schemataStrings) > 0 && strings.Compare(schemataStrings[0], l3CacheSchema) == 0 {
+		l3CacheSchemaMatch = true
+	}
+
+	if IsMbaEnabled() && memBwSchema != "" {
+		if IsCatEnabled() {
+			// Memory Bandwidth schema is in the second line if CAT is enabled
+			if len(schemataStrings) >= 2 && strings.Compare(schemataStrings[1], memBwSchema) == 0 {
+				memBwSchemaMatch = true
+			}
+		} else {
+			// Memory Bandwidth schema is in the first line if CAT is disabled
+			if len(schemataStrings) >= 1 && strings.Compare(schemataStrings[0], memBwSchema) == 0 {
+				memBwSchemaMatch = true
+			}
+		}
+	}
+
+	return l3CacheSchemaMatch, memBwSchemaMatch, nil
+}
+
+// Function to match given schema to schema represented by the given closID RDT group
+func ValidateClosIDAndSchemaMatch(closID string, l3CacheSchema string, memBwSchema string) error {
+	if closID == "" {
+		return fmt.Errorf("closID parameter is empty in the function call to ValidateClosIDAndSchemaMatch")
+	}
+
+	doesClosIDExist, err := DoesClosIDExist(closID)
+	if err != nil {
+		return err
+	}
+
+	// check if closID exists and requested schema matches schema represented by closID
+	if doesClosIDExist {
+		isMatchOnL3CacheSchema, isMatchOnMemBwSchema, err := CheckClosIDSchemaMatch(closID, l3CacheSchema, memBwSchema)
+		if err != nil {
+			return err
+		}
+
+		// Flag error if closID representing RDT control group exists and L3 Cache Schema does not match
+		if l3CacheSchema != "" && !isMatchOnL3CacheSchema {
+			return fmt.Errorf("l3CacheSchema does not match schema reported in closID")
+		}
+
+		// Flag error if clos_id representing RDT control group exists and Memory Bandwidth Schema does not match
+		if memBwSchema != "" && !isMatchOnMemBwSchema {
+			return fmt.Errorf("memBwSchema does not match schema reported in closID")
+		}
+	}
+
+	return nil
+}
+
+// Function to delete RDT group represented by given closID string
+func DeleteClosIDGroup(closID string) error {
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return err
+	}
+
+	path := filepath.Join(rootPath, closID)
+	return os.RemoveAll(path)
+}
+
+//Function to get RDT tasks from RDT group represented by given closID string
+func GetIntelRdtTasks(closID string) ([]int, error) {
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return nil, err
+	}
+
+	path := filepath.Join(rootPath, closID)
+
+	if _, err := os.Stat(path); err != nil {
+		return nil, err
+	}
+
+	tasksString, err := getIntelRdtParamString(path, IntelRdtTasks)
+	if err != nil {
+		return nil, err
+	}
+
+	tasks := strings.Split(tasksString, "\n")
+	var pids []int
+
+	for _, task := range tasks {
+		if pid, err := strconv.Atoi(task); err != nil {
+			return nil, err
+		} else {
+			pids = append(pids, pid)
+		}
+	}
+
+	return pids, nil
+}
+
 // Get the read-only memory bandwidth information
 func getMemBwInfo() (*MemBwInfo, error) {
 	memBwInfo := &MemBwInfo{}
@@ -470,6 +631,41 @@ func WriteIntelRdtTasks(dir string, pid int) error {
 	return nil
 }
 
+// WriteIntelRdtTasks writes the specified pids into the "tasks" file
+func WriteIntelRdtTaskList(dir string, pids []int) error {
+	if dir == "" {
+		return fmt.Errorf("no such directory for %s in WriteIntelRdtTaskList", IntelRdtTasks)
+	}
+
+	len := len(pids)
+
+	if len == 0 {
+		return fmt.Errorf("no valid number of pids supplied for %s in WriteIntelRdtTaskList", IntelRdtTasks)
+	}
+
+	tasks := ""
+	for i := 0; i < len-1; i++ {
+		// Dont attach any pid if -1 is specified as a pid
+		if pids[i] != -1 {
+			tasks += strconv.Itoa(pids[i]) + ","
+		}
+	}
+
+	if pids[len-1] != -1 {
+		tasks += strconv.Itoa(pids[len-1])
+	}
+
+	if tasks != "" {
+		if err := ioutil.WriteFile(filepath.Join(dir, IntelRdtTasks), []byte(tasks), 0700); err != nil {
+			return fmt.Errorf("failed to write %v to %v in WriteIntelRdtTaskList: %v", tasks, IntelRdtTasks, err)
+		}
+	} else {
+		return fmt.Errorf("no valid number of pids available for %s in WriteIntelRdtTaskList", IntelRdtTasks)
+	}
+
+	return nil
+}
+
 // Check if Intel RDT/CAT is enabled
 func IsCatEnabled() bool {
 	return isCatEnabled
@@ -492,6 +688,42 @@ func GetIntelRdtPath(id string) (string, error) {
 }
 
 // Applies Intel RDT configuration to the process with the specified pid
+func (m *IntelRdtManager) ApplyPids(pids []int) (err error) {
+	// If intelRdt is not specified in config, we do nothing
+	if m.Config.IntelRdt == nil {
+		return nil
+	}
+
+	rootPath, err := getIntelRdtRoot()
+	if err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id := ""
+	if m.Config.IntelRdt.ClosID != "" {
+		id = m.Config.IntelRdt.ClosID
+	} else {
+		id = m.Id
+	}
+
+	path := filepath.Join(rootPath, id)
+	if err := os.MkdirAll(path, 0755); err != nil {
+		return NewLastCmdError(err)
+	}
+
+	if err := WriteIntelRdtTaskList(path, pids); err != nil {
+		return NewLastCmdError(err)
+	}
+
+	m.Path = path
+
+	return nil
+}
+
+// Applies Intel RDT configuration to the process with the specified pid
 func (m *IntelRdtManager) Apply(pid int) (err error) {
 	// If intelRdt is not specified in config, we do nothing
 	if m.Config.IntelRdt == nil {
@@ -504,12 +736,21 @@ func (m *IntelRdtManager) Apply(pid int) (err error) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	path, err := d.join(m.Id)
-	if err != nil {
-		return err
+
+	if m.Config.IntelRdt.ClosID != "" {
+		path, err := d.join(m.Config.IntelRdt.ClosID)
+		if err != nil {
+			return err
+		}
+		m.Path = path
+	} else {
+		path, err := d.join(m.Id)
+		if err != nil {
+			return err
+		}
+		m.Path = path
 	}
 
-	m.Path = path
 	return nil
 }
 
@@ -526,11 +767,17 @@ func (m *IntelRdtManager) Destroy() error {
 
 // Returns Intel RDT path to save in a state file and to be able to
 // restore the object later
-func (m *IntelRdtManager) GetPath() string {
-	if m.Path == "" {
-		m.Path, _ = GetIntelRdtPath(m.Id)
+func (m *IntelRdtManager) GetPath(container *configs.Config) (string, error) {
+	var err error
+	err = nil
+
+	if container.IntelRdt != nil && container.IntelRdt.ClosID != "" {
+		m.Path, err = GetIntelRdtPath(container.IntelRdt.ClosID)
+	} else {
+		m.Path, err = GetIntelRdtPath(m.Id)
 	}
-	return m.Path
+
+	return m.Path, err
 }
 
 // Returns statistics for Intel RDT
@@ -555,8 +802,13 @@ func (m *IntelRdtManager) GetStats() (*Stats, error) {
 	}
 	schemaRootStrings := strings.Split(tmpRootStrings, "\n")
 
+	path, err := m.GetPath(m.Config)
+	if err != nil {
+		return nil, err
+	}
+
 	// The L3 cache and memory bandwidth schemata in 'container_id' group
-	tmpStrings, err := getIntelRdtParamString(m.GetPath(), "schemata")
+	tmpStrings, err := getIntelRdtParamString(path, "schemata")
 	if err != nil {
 		return nil, err
 	}
@@ -617,10 +869,18 @@ func (m *IntelRdtManager) Set(container *configs.Config) error {
 	// It has allocation bitmasks/values for L3 cache on each socket,
 	// which contains L3 cache id and capacity bitmask (CBM).
 	// 	Format: "L3:<cache_id0>=<cbm0>;<cache_id1>=<cbm1>;..."
+	//`clos_id` specifies the identity for RDT Class of Service (CLOS).
+	// The default `clos_id` remains `.` referring to top level directory
+	// of resctrl filesystem. Every `clos_id` identifies a set of tasks
+	// and schemata. clos_id' enables sharing of RDT control groups
+	// for resources like cache and memory bandwidth, among containers.
+	// In the context of runc, if `clos_id` is not set, we use the
+	// `container_id` of the container, implying a single container per
+	// control group, for which RDT resource constraints will be set.
 	// For example, on a two-socket machine, the schema line could be:
 	// 	L3:0=ff;1=c0
 	// which means L3 cache id 0's CBM is 0xff, and L3 cache id 1's CBM
-	// is 0xc0.
+	// is 0xc0 for all tasks assigned under `clos_id` `guaranteed_group`.
 	//
 	// The valid L3 cache CBM is a *contiguous bits set* and number of
 	// bits that can be set is less than the max bit. The max bits in the
@@ -636,7 +896,9 @@ func (m *IntelRdtManager) Set(container *configs.Config) error {
 	// contains L3 cache id and memory bandwidth percentage.
 	// 	Format: "MB:<cache_id0>=bandwidth0;<cache_id1>=bandwidth1;..."
 	// For example, on a two-socket machine, the schema line could be:
-	// 	"MB:0=20;1=70"
+	// 	"MB:0=20;1=70" under a `clos_id` `guaranteed_group`, which means
+	// all tasks assigned under `clos_id` `guaranteed_group` are allocated
+	// 20% memory bandwidth on socket 0 and 70% memory bandwidth on socket 1.
 	//
 	// The minimum bandwidth percentage value for each CPU model is
 	// predefined and can be looked up through "info/MB/min_bandwidth".
@@ -646,7 +908,10 @@ func (m *IntelRdtManager) Set(container *configs.Config) error {
 	// Intermediate values are rounded to the next control step available
 	// on the hardware.
 	if container.IntelRdt != nil {
-		path := m.GetPath()
+		path, err := m.GetPath(container)
+		if err != nil {
+			return err
+		}
 		l3CacheSchema := container.IntelRdt.L3CacheSchema
 		memBwSchema := container.IntelRdt.MemBwSchema
 
