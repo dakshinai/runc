@@ -310,7 +310,8 @@ func TestGetContainerStateAfterUpdate(t *testing.T) {
 			_pid:    pid,
 			started: stat.StartTime,
 		},
-		cgroupManager: &mockCgroupManager{},
+		cgroupManager:   &mockCgroupManager{},
+		intelRdtManager: &mockIntelRdtManager{},
 	}
 	container.state = &createdState{c: container}
 	state, err := container.State()

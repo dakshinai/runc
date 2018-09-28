@@ -1705,7 +1705,10 @@ func (c *linuxContainer) currentState() (*State, error) {
 		startTime, _ = c.initProcess.startTime()
 		externalDescriptors = c.initProcess.externalDescriptors()
 	}
-	intelRdtPath, _ := c.intelRdtManager.GetPath()
+	intelRdtPath := ""
+	if intelrdt.IsEnabled() {
+		intelRdtPath, _ = c.intelRdtManager.GetPath()
+	}
 	state := &State{
 		BaseState: BaseState{
 			ID:                   c.ID(),
