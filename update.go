@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/docker/go-units"
+	"github.com/opencontainers/runc/libcontainer"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/intelrdt"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -18,6 +19,132 @@ import (
 func i64Ptr(i int64) *int64   { return &i }
 func u64Ptr(i uint64) *uint64 { return &i }
 func u16Ptr(i uint16) *uint16 { return &i }
+
+// Helper function to match container Pids with tasks represented by ClosID RDT group
+// Since new container pids may be created that may not be added to RDT Clos ID group,
+// we only work with addition and removal of container pids matching RDT tasks.
+// We assume RDT removes tasks (processes) that no longer exist
+func matchContainerPidsInClosId(pids []int, closIDTasks []int) ([]int, []int) {
+	var matchingContainerPids []int
+	var nonMatchingClosIdTasks []int
+
+	for _, pid := range pids {
+		for _, task := range closIDTasks {
+			if pid == task {
+				matchingContainerPids = append(matchingContainerPids, pid)
+			}
+		}
+	}
+
+	for _, task := range closIDTasks {
+		isMatch := false
+		for _, pid := range pids {
+			if task == pid {
+				isMatch = true
+			}
+		}
+		if !isMatch {
+			nonMatchingClosIdTasks = append(nonMatchingClosIdTasks, task)
+		}
+	}
+
+	return matchingContainerPids, nonMatchingClosIdTasks
+}
+
+// Function to add container pids new ClosID RDT group
+// config holds new ClosID RDT group information
+// If ClosID is not provided the function adds the container pids to ContainerID RDT group
+func addContainerToClosID(config configs.Config, container libcontainer.Container) error {
+	containerPids, err := container.Processes()
+	if err != nil {
+		return err
+	}
+
+	state, err := container.State()
+	if err != nil {
+		return err
+	}
+
+	intelRdtManager := intelrdt.IntelRdtManager{
+		Config: &config,
+		Id:     container.ID(),
+		Path:   state.IntelRdtPath,
+	}
+
+	if err := intelRdtManager.ApplyPids(containerPids); err != nil {
+		return err
+	}
+
+	/*
+		if config.IntelRdt.ClosID != "" {
+			if err := intelRdtManager.ApplyPids(containerPids); err != nil {
+				return err
+			}
+
+		} else {
+			// If no ClosID is provided, add container pids to ContainerID RDT group
+			if err := intelRdtManager.Apply(state.InitProcessPid); err != nil {
+				return err
+			}
+		}
+	*/
+
+	return nil
+}
+
+// Function to move container pids from old ClosID to new ClosID RDT group
+// config holds new ClosID RDT group information
+// If old ClosID did not exist the function assumes that the container belong to ContainerID RDT group
+func moveContainerToClosID(config configs.Config, container libcontainer.Container, oldClosID string) error {
+	containerPids, err := container.Processes()
+	if err != nil {
+		return err
+	}
+
+	state, err := container.State()
+	if err != nil {
+		return err
+	}
+
+	intelRdtManager := intelrdt.IntelRdtManager{
+		Config: &config,
+		Id:     container.ID(),
+		Path:   state.IntelRdtPath,
+	}
+
+	if oldClosID != "" {
+		// If container belonged to old closID RDT group
+		closIDTasks, err := intelrdt.GetIntelRdtTasks(oldClosID)
+		if err != nil {
+			return err
+		}
+
+		// move all tasks of container from old ClosID to new ClosID RDT group
+		matchingContainerPids, nonMatchingClosIdTasks := matchContainerPidsInClosId(containerPids, closIDTasks)
+		// With RDT, tasks added to new ClosID RDT group are automatically removed from their old ClosID RDT group
+		if err := intelRdtManager.ApplyPids(matchingContainerPids); err != nil {
+			return err
+		}
+
+		// if no tasks remain in old ClosID, delete old ClosID RDT group
+		if len(nonMatchingClosIdTasks) == 0 {
+			if err := intelrdt.DeleteClosIDGroup(oldClosID); err != nil {
+				return err
+			}
+		}
+	} else {
+		// if container did not belong to old closID RDT group
+		// add container pids to new closID RDT group
+		if err := intelRdtManager.ApplyPids(containerPids); err != nil {
+			return err
+		}
+
+		//delete RDT group represented by Container ID RDT group
+		intelrdt.DeleteClosIDGroup(container.ID())
+	}
+
+	return nil
+}
 
 var updateCommand = cli.Command{
 	Name:      "update",
@@ -121,6 +248,10 @@ other options are ignored.
 		cli.StringFlag{
 			Name:  "mem-bw-schema",
 			Usage: "The string of Intel RDT/MBA memory bandwidth schema",
+		},
+		cli.StringFlag{
+			Name:  "rdt-clos-id",
+			Usage: "The string of Intel RDT clos ID",
 		},
 	},
 	Action: func(context *cli.Context) error {
@@ -267,6 +398,8 @@ other options are ignored.
 		// Update Intel RDT
 		l3CacheSchema := context.String("l3-cache-schema")
 		memBwSchema := context.String("mem-bw-schema")
+		closID := context.String("rdt-clos-id")
+
 		if l3CacheSchema != "" && !intelrdt.IsCatEnabled() {
 			return fmt.Errorf("Intel RDT/CAT: l3 cache schema is not enabled")
 		}
@@ -275,28 +408,70 @@ other options are ignored.
 			return fmt.Errorf("Intel RDT/MBA: memory bandwidth schema is not enabled")
 		}
 
+		// Schema is mandatory
 		if l3CacheSchema != "" || memBwSchema != "" {
-			// If intelRdt is not specified in original configuration, we just don't
-			// Apply() to create intelRdt group or attach tasks for this container.
-			// In update command, we could re-enable through IntelRdtManager.Apply()
-			// and then update intelrdt constraint.
-			if config.IntelRdt == nil {
-				state, err := container.State()
-				if err != nil {
+			// update closID and schema
+			if closID != "" {
+				if err := intelrdt.ValidateClosIDAndSchemaMatch(closID, l3CacheSchema, memBwSchema); err != nil {
 					return err
 				}
-				config.IntelRdt = &configs.IntelRdt{}
-				intelRdtManager := intelrdt.IntelRdtManager{
-					Config: &config,
-					Id:     container.ID(),
-					Path:   state.IntelRdtPath,
+				//existing schema update
+				if config.IntelRdt != nil {
+					oldClosID := config.IntelRdt.ClosID
+					config.IntelRdt.L3CacheSchema = l3CacheSchema
+					config.IntelRdt.MemBwSchema = memBwSchema
+					config.IntelRdt.ClosID = closID
+					if err := moveContainerToClosID(config, container, oldClosID); err != nil {
+						return err
+					}
+				} else {
+					config.IntelRdt = &configs.IntelRdt{}
+					config.IntelRdt.ClosID = closID
+					config.IntelRdt.L3CacheSchema = l3CacheSchema
+					config.IntelRdt.MemBwSchema = memBwSchema
+					if err := addContainerToClosID(config, container); err != nil {
+						return err
+					}
 				}
-				if err := intelRdtManager.Apply(state.InitProcessPid); err != nil {
-					return err
+			} else { // update schema
+				// existing schema update
+				if config.IntelRdt != nil {
+					// old closID exists
+					if config.IntelRdt.ClosID != "" {
+						closIDTasks, err := intelrdt.GetIntelRdtTasks(config.IntelRdt.ClosID)
+						if err != nil {
+							return err
+						}
+						containerPids, err := container.Processes()
+						if err != nil {
+							return err
+						}
+						_, nonMatchingClosIdTasks := matchContainerPidsInClosId(containerPids, closIDTasks)
+
+						if len(nonMatchingClosIdTasks) > 0 {
+							return fmt.Errorf("cannot update schema of this container since it belongs to a ClosID RDT group shared by other containers. Provide a new ClosID to create a seperate allocation")
+						} else {
+							oldClosID := config.IntelRdt.ClosID
+							config.IntelRdt.ClosID = ""
+							config.IntelRdt.L3CacheSchema = l3CacheSchema
+							config.IntelRdt.MemBwSchema = memBwSchema
+							if err := moveContainerToClosID(config, container, oldClosID); err != nil {
+								return err
+							}
+						}
+					} else {
+						config.IntelRdt.L3CacheSchema = l3CacheSchema
+						config.IntelRdt.MemBwSchema = memBwSchema
+					}
+				} else {
+					config.IntelRdt = &configs.IntelRdt{}
+					config.IntelRdt.L3CacheSchema = l3CacheSchema
+					config.IntelRdt.MemBwSchema = memBwSchema
+					if err := addContainerToClosID(config, container); err != nil {
+						return err
+					}
 				}
 			}
-			config.IntelRdt.L3CacheSchema = l3CacheSchema
-			config.IntelRdt.MemBwSchema = memBwSchema
 		}
 
 		return container.Set(config)
