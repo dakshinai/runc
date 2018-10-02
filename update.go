@@ -118,6 +118,10 @@ other options are ignored.
 			Name:  "l3-cache-schema",
 			Usage: "The string of Intel RDT/CAT L3 cache schema",
 		},
+		cli.StringFlag{
+			Name:  "rdt-clos-id",
+			Usage: "The string of Intel RDT L3 clos ID",
+		},
 	},
 	Action: func(context *cli.Context) error {
 		if err := checkArgs(context, 1, exactArgs); err != nil {
@@ -276,6 +280,9 @@ other options are ignored.
 					return err
 				}
 				config.IntelRdt = &configs.IntelRdt{}
+				if val := context.String("rdt-clos-id"); val != "" {
+					config.IntelRdt.ClosID = val
+				}
 				intelRdtManager := intelrdt.IntelRdtManager{
 					Config: &config,
 					Id:     container.ID(),
